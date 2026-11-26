@@ -20,6 +20,7 @@ import android.telephony.SmsManager
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
+import androidx.core.net.toUri
 import androidx.localbroadcastmanager.content.LocalBroadcastManager
 import com.google.gson.Gson
 import fi.iki.elonen.NanoHTTPD
@@ -28,21 +29,10 @@ import java.util.Locale
 
 data class ContactItem(val name: String, val phone: String)
 
-data class SendTextRequest(
-    val phone: String = "",
-    val message: String = ""
-)
 data class MediaPartItem(
     val partId: Long,
     val contentType: String,
     val isVideo: Boolean
-)
-
-private data class MultipartPart(
-    val name: String,
-    val fileName: String?,
-    val isFile: Boolean,
-    val bytes: ByteArray
 )
 
 data class ChatMessageItem(
@@ -59,6 +49,18 @@ data class ApiResponse(
     val success: Boolean,
     val error: String? = null,
     val resolvedPhone: String? = null
+)
+
+data class SendTextRequest(
+    val phone: String = "",
+    val message: String = ""
+)
+
+private class MultipartPart(
+    val name: String,
+    val fileName: String?,
+    val isFile: Boolean,
+    val bytes: ByteArray
 )
 
 class SmsServerService : Service() {
@@ -102,25 +104,19 @@ class SmsServerService : Service() {
     }
 
     private fun createNotificationChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(
-                CHANNEL_ID,
-                "Web SMS Taustapalvelu",
-                NotificationManager.IMPORTANCE_LOW
-            ).apply {
-                description = "Pitää paikallisen Web SMS -palvelimen käynnissä taustalla"
-            }
-            val manager = getSystemService(NotificationManager::class.java)
-            manager.createNotificationChannel(channel)
+        val channel = NotificationChannel(
+            CHANNEL_ID,
+            "Web SMS Taustapalvelu",
+            NotificationManager.IMPORTANCE_LOW
+        ).apply {
+            description = "Pitää paikallisen Web SMS -palvelimen käynnissä taustalla"
         }
+        val manager = getSystemService(NotificationManager::class.java)
+        manager.createNotificationChannel(channel)
     }
 
     private fun buildNotification(statusText: String): Notification {
-        val contentText = if (currentUrl.isNotBlank()) {
-            "$currentUrl · $statusText"
-        } else {
-            statusText
-        }
+        val contentText = currentUrl.ifBlank { null }?.let { "$it · $statusText" } ?: statusText
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("Web SMS -palvelin")
             .setContentText(contentText)
@@ -191,55 +187,6 @@ class SmsServerService : Service() {
         LocalBroadcastManager.getInstance(this).sendBroadcast(intent)
     }
 
-    private fun resolveRecipientPhone(rawInput: String): Pair<String?, String?> {
-        val trimmed = rawInput.trim()
-        if (trimmed.isEmpty()) {
-            return Pair(null, "Valitse vastaanottaja tai syötä nimi/puhelinnumero.")
-        }
-
-        val contacts = getPhoneContacts()
-        val hasDigits = trimmed.any { it.isDigit() }
-
-        if (hasDigits) {
-            val normInput = normalizePhone(trimmed)
-            val suffix = if (normInput.length >= 7) normInput.takeLast(7) else normInput
-
-            val phoneMatches = contacts.filter { contact ->
-                val normContact = normalizePhone(contact.phone)
-                if (suffix.length >= 7 && normContact.length >= 7) {
-                    normContact.endsWith(suffix)
-                } else {
-                    normContact == normInput || contact.phone.equals(trimmed, ignoreCase = true)
-                }
-            }
-
-            val distinctPhones = phoneMatches.map { normalizePhone(it.phone) }.distinct()
-            return when {
-                phoneMatches.size == 1 -> Pair(phoneMatches.first().phone, null)
-                distinctPhones.size == 1 -> Pair(phoneMatches.first().phone, null)
-                phoneMatches.isEmpty() -> Pair(trimmed, null) // Suora puhelinnumero, jota ei ole osoitekirjassa
-                else -> Pair(null, "Numero '$trimmed' täsmää useaan yhteystietoon. Tarkenna numero.")
-            }
-        }
-
-        // Syöte on pelkkää nimeä -> vaatii yksiselitteisen osuman osoitekirjasta/keskusteluista
-        val exactNameMatches = contacts.filter {
-            it.name.equals(trimmed, ignoreCase = true)
-        }
-        val candidates = if (exactNameMatches.isNotEmpty()) {
-            exactNameMatches
-        } else {
-            contacts.filter { it.name.contains(trimmed, ignoreCase = true) }
-        }
-
-        val uniquePhones = candidates.map { normalizePhone(it.phone) }.distinct()
-        return when {
-            candidates.isEmpty() -> Pair(null, "Yhteystietoa '$trimmed' ei löytynyt.")
-            uniquePhones.size == 1 -> Pair(candidates.first().phone, null)
-            else -> Pair(null, "Nimi '$trimmed' on moniselitteinen (${uniquePhones.size} eri numeroa). Tarkenna nimi tai valitse listasta.")
-        }
-    }
-
     private fun startServer() {
         try {
             val ip = getWifiIpAddress()
@@ -282,6 +229,52 @@ class SmsServerService : Service() {
             candNorm.endsWith(targetNorm.takeLast(7)) || targetNorm.endsWith(candNorm.takeLast(7))
         } else {
             candidateAddress.equals(rawFilter, ignoreCase = true)
+        }
+    }
+
+    private fun resolveRecipientPhone(rawInput: String): Pair<String?, String?> {
+        val trimmed = rawInput.trim()
+        if (trimmed.isEmpty()) {
+            return Pair(null, "Valitse vastaanottaja tai syötä nimi/puhelinnumero.")
+        }
+
+        val contacts = getPhoneContacts()
+        val hasDigits = trimmed.any { it.isDigit() }
+
+        if (hasDigits) {
+            val normInput = normalizePhone(trimmed)
+            val suffix = if (normInput.length >= 7) normInput.takeLast(7) else normInput
+
+            val phoneMatches = contacts.filter { contact ->
+                val normContact = normalizePhone(contact.phone)
+                if (suffix.length >= 7 && normContact.length >= 7) {
+                    normContact.endsWith(suffix)
+                } else {
+                    normContact == normInput || contact.phone.equals(trimmed, ignoreCase = true)
+                }
+            }
+
+            val distinctPhones = phoneMatches.map { normalizePhone(it.phone) }.distinct()
+            return when {
+                phoneMatches.size == 1 -> Pair(phoneMatches.first().phone, null)
+                distinctPhones.size == 1 -> Pair(phoneMatches.first().phone, null)
+                phoneMatches.isEmpty() -> Pair(trimmed, null)
+                else -> Pair(null, "Numero '$trimmed' täsmää useaan yhteystietoon. Tarkenna numero.")
+            }
+        }
+
+        val exactNameMatches = contacts.filter {
+            it.name.equals(trimmed, ignoreCase = true)
+        }
+        val candidates = exactNameMatches.ifEmpty {
+            contacts.filter { it.name.contains(trimmed, ignoreCase = true) }
+        }
+
+        val uniquePhones = candidates.map { normalizePhone(it.phone) }.distinct()
+        return when {
+            candidates.isEmpty() -> Pair(null, "Yhteystietoa '$trimmed' ei löytynyt.")
+            uniquePhones.size == 1 -> Pair(candidates.first().phone, null)
+            else -> Pair(null, "Nimi '$trimmed' on moniselitteinen (${uniquePhones.size} eri numeroa). Tarkenna nimi tai valitse listasta.")
         }
     }
 
@@ -331,7 +324,7 @@ class SmsServerService : Service() {
             }
 
             contentResolver.query(
-                Uri.parse("content://mms"),
+                "content://mms".toUri(),
                 arrayOf("_id"),
                 null,
                 null,
@@ -359,7 +352,7 @@ class SmsServerService : Service() {
     }
 
     private fun getMmsCounterpartAddress(mmsId: Long, isSent: Boolean): String {
-        val addrUri = Uri.parse("content://mms/$mmsId/addr")
+        val addrUri = "content://mms/$mmsId/addr".toUri()
         val targetType = if (isSent) 151 else 137
         var fallbackAddress = ""
 
@@ -382,7 +375,7 @@ class SmsServerService : Service() {
     }
 
     private fun getMmsParts(mmsId: Long): Pair<String, List<MediaPartItem>> {
-        val partUri = Uri.parse("content://mms/part")
+        val partUri = "content://mms/part".toUri()
         val textBuilder = StringBuilder()
         val mediaList = mutableListOf<MediaPartItem>()
 
@@ -408,7 +401,7 @@ class SmsServerService : Service() {
                         textBuilder.append(bodyText)
                     } else {
                         try {
-                            contentResolver.openInputStream(Uri.parse("content://mms/part/$partId"))?.use { input ->
+                            contentResolver.openInputStream("content://mms/part/$partId".toUri())?.use { input ->
                                 val streamText = input.bufferedReader().readText().trim()
                                 if (streamText.isNotEmpty()) {
                                     if (textBuilder.isNotEmpty()) textBuilder.append("\n")
@@ -478,7 +471,7 @@ class SmsServerService : Service() {
         }
 
         contentResolver.query(
-            Uri.parse("content://mms"),
+            "content://mms".toUri(),
             arrayOf("_id", "date", "msg_box"),
             null,
             null,
@@ -518,7 +511,7 @@ class SmsServerService : Service() {
 
     private fun sendSms(phone: String, message: String) {
         val smsManager: SmsManager = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            this.getSystemService(SmsManager::class.java)
+            getSystemService(SmsManager::class.java)
         } else {
             @Suppress("DEPRECATION")
             SmsManager.getDefault()
@@ -619,9 +612,7 @@ class SmsServerService : Service() {
                         }
                     }
                 }
-                if (!defaultSmsPackage.isNullOrBlank()) {
-                    setPackage(defaultSmsPackage)
-                }
+                defaultSmsPackage?.ifBlank { null }?.let { setPackage(it) }
             }
 
             startActivity(intent)
@@ -630,18 +621,147 @@ class SmsServerService : Service() {
         }
     }
 
+    private fun readRequestBodyBytes(session: NanoHTTPD.IHTTPSession): ByteArray {
+        val contentLength = session.headers["content-length"]?.toIntOrNull() ?: 0
+        if (contentLength <= 0) {
+            return try {
+                session.inputStream.readBytes()
+            } catch (_: Exception) {
+                ByteArray(0)
+            }
+        }
+        if (contentLength > 50 * 1024 * 1024) {
+            return ByteArray(0)
+        }
+
+        val buf = ByteArray(contentLength)
+        var offset = 0
+        while (offset < contentLength) {
+            val read = session.inputStream.read(buf, offset, contentLength - offset)
+            if (read <= 0) break
+            offset += read
+        }
+        return buf.copyOf(offset)
+    }
+
+    private fun parseMultipartParts(session: NanoHTTPD.IHTTPSession, bodyBytes: ByteArray): List<MultipartPart> {
+        if (bodyBytes.isEmpty()) return emptyList()
+
+        val contentType = session.headers["content-type"].orEmpty()
+        val boundary = Regex("boundary=([^;\\s]+)").find(contentType)?.groupValues?.get(1)?.trim('"')
+            ?: return emptyList()
+
+        val boundaryBytes = "--$boundary".toByteArray(Charsets.ISO_8859_1)
+        val crlfCrlf = "\r\n\r\n".toByteArray(Charsets.ISO_8859_1)
+
+        val parts = mutableListOf<MultipartPart>()
+        var pos = indexOfBytes(bodyBytes, boundaryBytes, 0)
+
+        while (pos >= 0) {
+            val partStart = pos + boundaryBytes.size
+            if (partStart + 1 < bodyBytes.size &&
+                bodyBytes[partStart] == '-'.code.toByte() &&
+                bodyBytes[partStart + 1] == '-'.code.toByte()
+            ) {
+                break
+            }
+
+            val headerStart = if (partStart + 1 < bodyBytes.size &&
+                bodyBytes[partStart] == '\r'.code.toByte() &&
+                bodyBytes[partStart + 1] == '\n'.code.toByte()
+            ) {
+                partStart + 2
+            } else {
+                partStart
+            }
+
+            val headerEnd = indexOfBytes(bodyBytes, crlfCrlf, headerStart)
+            if (headerEnd < 0) break
+
+            val headersText = String(bodyBytes, headerStart, headerEnd - headerStart, Charsets.ISO_8859_1)
+            val fieldName = Regex("name=\"([^\"]+)\"").find(headersText)?.groupValues?.get(1)
+            val rawFileName = Regex("filename=\"([^\"]*)\"").find(headersText)?.groupValues?.get(1)
+            val isFile = rawFileName != null
+
+            val valueStart = headerEnd + crlfCrlf.size
+            val nextBoundary = indexOfBytes(bodyBytes, boundaryBytes, valueStart)
+            if (nextBoundary < 0) break
+
+            var valueEnd = nextBoundary
+            if (valueEnd >= 2 &&
+                bodyBytes[valueEnd - 2] == '\r'.code.toByte() &&
+                bodyBytes[valueEnd - 1] == '\n'.code.toByte()
+            ) {
+                valueEnd -= 2
+            }
+
+            if (fieldName != null && valueEnd >= valueStart) {
+                val partBytes = bodyBytes.copyOfRange(valueStart, valueEnd)
+                val cleanFileName = rawFileName?.let {
+                    String(it.toByteArray(Charsets.ISO_8859_1), Charsets.UTF_8)
+                        .substringAfterLast("/")
+                        .substringAfterLast("\\")
+                }
+                parts.add(
+                    MultipartPart(
+                        name = fieldName,
+                        fileName = cleanFileName,
+                        isFile = isFile,
+                        bytes = partBytes
+                    )
+                )
+            }
+
+            pos = nextBoundary
+        }
+
+        return parts
+    }
+
+    private fun writeTempAttachmentFile(bytes: ByteArray, index: Int, batchTimestamp: Long, originalFileName: String?): File {
+        val safeOriginal = originalFileName.orEmpty()
+        val rawExt = safeOriginal.substringAfterLast(".", "").lowercase(Locale.ROOT)
+        val extension = rawExt.ifBlank { "jpg" }
+        val safeName = "upload_${batchTimestamp}_${index}.$extension"
+
+        val tempFile = File(cacheDir, "mms_part_${batchTimestamp}_${index}.$extension")
+        tempFile.writeBytes(bytes)
+
+        return when (extension) {
+            "jpg", "jpeg", "png", "gif", "webp" -> saveImage(tempFile.absolutePath, safeName).also { tempFile.delete() }
+            "mp4", "3gp", "mkv", "avi", "webm" -> saveVideo(tempFile.absolutePath, safeName).also { tempFile.delete() }
+            else -> saveUploadedFile(tempFile.absolutePath, safeName).also { tempFile.delete() }
+        }
+    }
+
+    private fun indexOfBytes(haystack: ByteArray, needle: ByteArray, fromIndex: Int): Int {
+        if (needle.isEmpty() || fromIndex >= haystack.size) return -1
+        val limit = haystack.size - needle.size
+        for (i in fromIndex..limit) {
+            var matched = true
+            for (j in needle.indices) {
+                if (haystack[i + j] != needle[j]) {
+                    matched = false
+                    break
+                }
+            }
+            if (matched) return i
+        }
+        return -1
+    }
+
     inner class SmsWebServer(port: Int) : NanoHTTPD(port) {
         private val gson = Gson()
 
         override fun serve(session: IHTTPSession): Response {
-            return when {
-                session.uri == "/api/contacts" && session.method == Method.GET -> {
+            return when (session.uri) {
+                "/api/contacts" -> {
                     val json = gson.toJson(getPhoneContacts())
                     newFixedLengthResponse(Response.Status.OK, "application/json; charset=utf-8", json)
                 }
 
-                session.uri == "/api/messages" && session.method == Method.GET -> {
-                    val rawPhoneParam = decodeUtf8Field(session.parameters["phone"]?.firstOrNull()?.trim())
+                "/api/messages" -> {
+                    val rawPhoneParam = session.parameters["phone"]?.firstOrNull()?.trim().orEmpty()
                     val effectivePhone = if (rawPhoneParam.isNotEmpty() && !rawPhoneParam.any { it.isDigit() }) {
                         resolveRecipientPhone(rawPhoneParam).first ?: rawPhoneParam
                     } else {
@@ -651,16 +771,16 @@ class SmsServerService : Service() {
                     newFixedLengthResponse(Response.Status.OK, "application/json; charset=utf-8", json)
                 }
 
-                session.uri == "/api/mms-part" && session.method == Method.GET -> {
+                "/api/mms-part" -> {
                     val partId = session.parameters["partId"]?.firstOrNull()?.toLongOrNull()
                     if (partId == null || ContextCompat.checkSelfPermission(this@SmsServerService, Manifest.permission.READ_SMS) != PackageManager.PERMISSION_GRANTED) {
                         return newFixedLengthResponse(Response.Status.BAD_REQUEST, "text/plain; charset=utf-8", "Virheellinen partId tai lupa puuttuu")
                     }
 
-                    val partUri = Uri.parse("content://mms/part/$partId")
+                    val partUri = "content://mms/part/$partId".toUri()
                     var mimeType = "application/octet-stream"
                     contentResolver.query(
-                        Uri.parse("content://mms/part"),
+                        "content://mms/part".toUri(),
                         arrayOf("ct"),
                         "_id = ?",
                         arrayOf(partId.toString()),
@@ -678,7 +798,42 @@ class SmsServerService : Service() {
                     newChunkedResponse(Response.Status.OK, mimeType, inputStream)
                 }
 
-                session.uri == "/api/send" && session.method == Method.POST -> {
+                "/api/send-text" -> {
+                    if (session.method != Method.POST) {
+                        return newFixedLengthResponse(Response.Status.METHOD_NOT_ALLOWED, "application/json; charset=utf-8", gson.toJson(ApiResponse(success = false, error = "Vain POST sallittu")))
+                    }
+
+                    val rawBody = String(readRequestBodyBytes(session), Charsets.UTF_8)
+                    val req = try {
+                        gson.fromJson(rawBody, SendTextRequest::class.java) ?: SendTextRequest()
+                    } catch (_: Exception) {
+                        SendTextRequest()
+                    }
+
+                    val rawRecipient = req.phone.trim()
+                    val message = req.message.trim()
+                    val (resolvedPhone, recipientError) = resolveRecipientPhone(rawRecipient)
+
+                    if (recipientError != null || resolvedPhone.isNullOrBlank()) {
+                        val errJson = gson.toJson(ApiResponse(success = false, error = recipientError ?: "Virheellinen vastaanottaja"))
+                        return newFixedLengthResponse(Response.Status.BAD_REQUEST, "application/json; charset=utf-8", errJson)
+                    }
+
+                    try {
+                        sendSms(resolvedPhone, message)
+                        val okJson = gson.toJson(ApiResponse(success = true, resolvedPhone = resolvedPhone))
+                        newFixedLengthResponse(Response.Status.OK, "application/json; charset=utf-8", okJson)
+                    } catch (e: Exception) {
+                        val errJson = gson.toJson(ApiResponse(success = false, error = e.message ?: "Tuntematon virhe"))
+                        newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "application/json; charset=utf-8", errJson)
+                    }
+                }
+
+                "/api/send" -> {
+                    if (session.method != Method.POST) {
+                        return newFixedLengthResponse(Response.Status.METHOD_NOT_ALLOWED, "application/json; charset=utf-8", gson.toJson(ApiResponse(success = false, error = "Vain POST sallittu")))
+                    }
+
                     val bodyBytes = readRequestBodyBytes(session)
                     val parts = parseMultipartParts(session, bodyBytes)
 
@@ -707,13 +862,13 @@ class SmsServerService : Service() {
 
                     fileParts.forEachIndexed { index, filePart ->
                         val suffix = if (filePart.name == "attachment") "" else "_${filePart.name.removePrefix("attachment_")}"
-                        val partFileName = filePart.fileName?.takeIf { it.isNotBlank() }
-                            ?: textFields["fileName$suffix"]?.takeIf { it.isNotBlank() }
+                        val partFileName = filePart.fileName?.ifBlank { null }
+                            ?: textFields["fileName$suffix"]?.ifBlank { null }
                         val saved = writeTempAttachmentFile(filePart.bytes, index, batchTimestamp, partFileName)
                         savedFiles.add(saved)
                     }
 
-                    return try {
+                    try {
                         if (savedFiles.isNotEmpty()) {
                             openMmsComposer(resolvedPhone, message, savedFiles)
                         } else {
@@ -728,193 +883,10 @@ class SmsServerService : Service() {
                     }
                 }
 
-                session.uri == "/api/send-text" && session.method == Method.POST -> {
-                    val contentLength = session.headers["content-length"]?.toIntOrNull() ?: 0
-                    val rawBody = if (contentLength > 0) {
-                        val bytes = ByteArray(contentLength)
-                        var offset = 0
-                        while (offset < contentLength) {
-                            val read = session.inputStream.read(bytes, offset, contentLength - offset)
-                            if (read <= 0) break
-                            offset += read
-                        }
-                        String(bytes, 0, offset, Charsets.UTF_8)
-                    } else {
-                        session.inputStream.bufferedReader(Charsets.UTF_8).readText()
-                    }
-
-                    val req = try {
-                        gson.fromJson(rawBody, SendTextRequest::class.java) ?: SendTextRequest()
-                    } catch (_: Exception) {
-                        SendTextRequest()
-                    }
-
-                    val rawRecipient = req.phone.trim()
-                    val message = req.message.trim()
-                    val (resolvedPhone, recipientError) = resolveRecipientPhone(rawRecipient)
-
-                    if (recipientError != null || resolvedPhone.isNullOrBlank()) {
-                        val errJson = gson.toJson(ApiResponse(success = false, error = recipientError ?: "Virheellinen vastaanottaja"))
-                        return newFixedLengthResponse(Response.Status.BAD_REQUEST, "application/json; charset=utf-8", errJson)
-                    }
-
-                    return try {
-                        sendSms(resolvedPhone, message)
-                        val okJson = gson.toJson(ApiResponse(success = true, resolvedPhone = resolvedPhone))
-                        newFixedLengthResponse(Response.Status.OK, "application/json; charset=utf-8", okJson)
-                    } catch (e: Exception) {
-                        val errJson = gson.toJson(ApiResponse(success = false, error = e.message ?: "Tuntematon virhe"))
-                        newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "application/json; charset=utf-8", errJson)
-                    }
-                }
-
                 else -> {
                     newFixedLengthResponse(Response.Status.OK, "text/html; charset=utf-8", getWebHtml())
                 }
             }
-        }
-
-        private fun decodeUtf8Field(raw: String?): String {
-            if (raw.isNullOrEmpty()) return ""
-            return when {
-                raw.contains('Ã') || raw.contains('Å') -> {
-                    try {
-                        String(raw.toByteArray(Charsets.ISO_8859_1), Charsets.UTF_8)
-                    } catch (_: Exception) {
-                        raw
-                    }
-                }
-                else -> raw
-            }
-        }
-
-        private fun readRequestBodyBytes(session: NanoHTTPD.IHTTPSession): ByteArray {
-            val contentLength = session.headers["content-length"]?.toIntOrNull() ?: 0
-            if (contentLength <= 0) {
-                return try {
-                    session.inputStream.readBytes()
-                } catch (_: Exception) {
-                    ByteArray(0)
-                }
-            }
-            if (contentLength > 50 * 1024 * 1024) {
-                return ByteArray(0)
-            }
-
-            val buf = ByteArray(contentLength)
-            var offset = 0
-            while (offset < contentLength) {
-                val read = session.inputStream.read(buf, offset, contentLength - offset)
-                if (read <= 0) break
-                offset += read
-            }
-            return buf.copyOf(offset)
-        }
-
-        private fun parseMultipartParts(session: NanoHTTPD.IHTTPSession, bodyBytes: ByteArray): List<MultipartPart> {
-            if (bodyBytes.isEmpty()) return emptyList()
-
-            val contentType = session.headers["content-type"].orEmpty()
-            val boundary = Regex("boundary=([^;\\s]+)").find(contentType)?.groupValues?.get(1)?.trim('"')
-                ?: return emptyList()
-
-            val boundaryBytes = "--$boundary".toByteArray(Charsets.ISO_8859_1)
-            val crlfCrlf = "\r\n\r\n".toByteArray(Charsets.ISO_8859_1)
-
-            val parts = mutableListOf<MultipartPart>()
-            var pos = indexOfBytes(bodyBytes, boundaryBytes, 0)
-
-            while (pos >= 0) {
-                val partStart = pos + boundaryBytes.size
-                if (partStart + 1 < bodyBytes.size &&
-                    bodyBytes[partStart] == '-'.code.toByte() &&
-                    bodyBytes[partStart + 1] == '-'.code.toByte()
-                ) {
-                    break
-                }
-
-                val headerStart = if (partStart + 1 < bodyBytes.size &&
-                    bodyBytes[partStart] == '\r'.code.toByte() &&
-                    bodyBytes[partStart + 1] == '\n'.code.toByte()
-                ) {
-                    partStart + 2
-                } else {
-                    partStart
-                }
-
-                val headerEnd = indexOfBytes(bodyBytes, crlfCrlf, headerStart)
-                if (headerEnd < 0) break
-
-                val headersText = String(bodyBytes, headerStart, headerEnd - headerStart, Charsets.ISO_8859_1)
-                val fieldName = Regex("name=\"([^\"]+)\"").find(headersText)?.groupValues?.get(1)
-                val rawFileName = Regex("filename=\"([^\"]*)\"").find(headersText)?.groupValues?.get(1)
-                val isFile = rawFileName != null
-
-                val valueStart = headerEnd + crlfCrlf.size
-                val nextBoundary = indexOfBytes(bodyBytes, boundaryBytes, valueStart)
-                if (nextBoundary < 0) break
-
-                var valueEnd = nextBoundary
-                if (valueEnd >= 2 &&
-                    bodyBytes[valueEnd - 2] == '\r'.code.toByte() &&
-                    bodyBytes[valueEnd - 1] == '\n'.code.toByte()
-                ) {
-                    valueEnd -= 2
-                }
-
-                if (fieldName != null && valueEnd >= valueStart) {
-                    val partBytes = bodyBytes.copyOfRange(valueStart, valueEnd)
-                    val cleanFileName = rawFileName?.let {
-                        String(it.toByteArray(Charsets.ISO_8859_1), Charsets.UTF_8)
-                            .substringAfterLast("/")
-                            .substringAfterLast("\\")
-                    }
-                    parts.add(
-                        MultipartPart(
-                            name = fieldName,
-                            fileName = cleanFileName,
-                            isFile = isFile,
-                            bytes = partBytes
-                        )
-                    )
-                }
-
-                pos = nextBoundary
-            }
-
-            return parts
-        }
-
-        private fun writeTempAttachmentFile(bytes: ByteArray, index: Int, batchTimestamp: Long, originalFileName: String?): File {
-            val safeOriginal = originalFileName.orEmpty()
-            val rawExt = safeOriginal.substringAfterLast(".", "").lowercase(Locale.ROOT)
-            val extension = if (rawExt.isNotBlank()) rawExt else "jpg"
-            val safeName = "upload_${batchTimestamp}_${index}.$extension"
-
-            val tempFile = File(cacheDir, "mms_part_${batchTimestamp}_${index}.$extension")
-            tempFile.writeBytes(bytes)
-
-            return when (extension) {
-                "jpg", "jpeg", "png", "gif", "webp" -> saveImage(tempFile.absolutePath, safeName).also { tempFile.delete() }
-                "mp4", "3gp", "mkv", "avi", "webm" -> saveVideo(tempFile.absolutePath, safeName).also { tempFile.delete() }
-                else -> saveUploadedFile(tempFile.absolutePath, safeName).also { tempFile.delete() }
-            }
-        }
-
-        private fun indexOfBytes(haystack: ByteArray, needle: ByteArray, fromIndex: Int): Int {
-            if (needle.isEmpty() || fromIndex >= haystack.size) return -1
-            val limit = haystack.size - needle.size
-            for (i in fromIndex..limit) {
-                var matched = true
-                for (j in needle.indices) {
-                    if (haystack[i + j] != needle[j]) {
-                        matched = false
-                        break
-                    }
-                }
-                if (matched) return i
-            }
-            return -1
         }
 
         private fun getWebHtml(): String = """
@@ -962,7 +934,7 @@ class SmsServerService : Service() {
                 </div>
                 <div id="chat">
                     <div id="chatHeader">
-                        <h2 id="recipientTitle">Valitse keskustelu, syötä numero tai anna nimi</h2>
+                        <h2 id="recipientTitle">Valitse keskustelu tai syötä numero</h2>
                         <input type="text" id="manualPhone" placeholder="Nimi tai numero (+358...)" onchange="loadMessages(this.value)">
                         <button id="refreshBtn" onclick="loadMessages(document.getElementById('manualPhone').value)">Päivitä</button>
                     </div>

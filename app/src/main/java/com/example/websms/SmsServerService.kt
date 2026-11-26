@@ -28,6 +28,10 @@ import java.util.Locale
 
 data class ContactItem(val name: String, val phone: String)
 
+data class SendTextRequest(
+    val phone: String = "",
+    val message: String = ""
+)
 data class MediaPartItem(
     val partId: Long,
     val contentType: String,
@@ -630,7 +634,7 @@ class SmsServerService : Service() {
                 }
 
                 session.uri == "/api/messages" && session.method == Method.GET -> {
-                    val rawPhoneParam = session.parameters["phone"]?.firstOrNull()?.trim().orEmpty()
+                    val rawPhoneParam = decodeUtf8Field(session.parameters["phone"]?.firstOrNull()?.trim())
                     val effectivePhone = if (rawPhoneParam.isNotEmpty() && !rawPhoneParam.any { it.isDigit() }) {
                         resolveRecipientPhone(rawPhoneParam).first ?: rawPhoneParam
                     } else {
@@ -671,8 +675,8 @@ class SmsServerService : Service() {
                     val filesMap = HashMap<String, String>()
                     session.parseBody(filesMap)
 
-                    val rawRecipient = session.parameters["phone"]?.firstOrNull()?.trim().orEmpty()
-                    val message = session.parameters["message"]?.firstOrNull()?.trim().orEmpty()
+                    val rawRecipient = decodeUtf8Field(session.parameters["phone"]?.firstOrNull()?.trim())
+                    val message = decodeUtf8Field(session.parameters["message"]?.firstOrNull()?.trim())
                     val (resolvedPhone, recipientError) = resolveRecipientPhone(rawRecipient)
 
                     if (recipientError != null || resolvedPhone.isNullOrBlank()) {
@@ -726,9 +730,63 @@ class SmsServerService : Service() {
                     }
                 }
 
+                session.uri == "/api/send-text" && session.method == Method.POST -> {
+                    val contentLength = session.headers["content-length"]?.toIntOrNull() ?: 0
+                    val rawBody = if (contentLength > 0) {
+                        val bytes = ByteArray(contentLength)
+                        var offset = 0
+                        while (offset < contentLength) {
+                            val read = session.inputStream.read(bytes, offset, contentLength - offset)
+                            if (read <= 0) break
+                            offset += read
+                        }
+                        String(bytes, 0, offset, Charsets.UTF_8)
+                    } else {
+                        session.inputStream.bufferedReader(Charsets.UTF_8).readText()
+                    }
+
+                    val req = try {
+                        gson.fromJson(rawBody, SendTextRequest::class.java) ?: SendTextRequest()
+                    } catch (_: Exception) {
+                        SendTextRequest()
+                    }
+
+                    val rawRecipient = req.phone.trim()
+                    val message = req.message.trim()
+                    val (resolvedPhone, recipientError) = resolveRecipientPhone(rawRecipient)
+
+                    if (recipientError != null || resolvedPhone.isNullOrBlank()) {
+                        val errJson = gson.toJson(ApiResponse(success = false, error = recipientError ?: "Virheellinen vastaanottaja"))
+                        return newFixedLengthResponse(Response.Status.BAD_REQUEST, "application/json; charset=utf-8", errJson)
+                    }
+
+                    return try {
+                        sendSms(resolvedPhone, message)
+                        val okJson = gson.toJson(ApiResponse(success = true, resolvedPhone = resolvedPhone))
+                        newFixedLengthResponse(Response.Status.OK, "application/json; charset=utf-8", okJson)
+                    } catch (e: Exception) {
+                        val errJson = gson.toJson(ApiResponse(success = false, error = e.message ?: "Tuntematon virhe"))
+                        newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "application/json; charset=utf-8", errJson)
+                    }
+                }
+
                 else -> {
                     newFixedLengthResponse(Response.Status.OK, "text/html; charset=utf-8", getWebHtml())
                 }
+            }
+        }
+
+        private fun decodeUtf8Field(raw: String?): String {
+            if (raw.isNullOrEmpty()) return ""
+            // Jos merkkijono sisältää tyypillisiä UTF-8 -> ISO-8859-1 -virhemerkkejä (esim. Ã¤, Ã¶, Ã)
+            return if (raw.contains('Ã') || raw.contains('Å')) {
+                try {
+                    String(raw.toByteArray(Charsets.ISO_8859_1), Charsets.UTF_8)
+                } catch (_: Exception) {
+                    raw
+                }
+            } else {
+                raw
             }
         }
 
@@ -894,19 +952,29 @@ class SmsServerService : Service() {
                             return;
                         }
 
-                        const formData = new FormData();
-                        formData.append("phone", phone);
-                        formData.append("message", message);
-                        files.forEach((file, idx) => {
-                            formData.append("attachment_" + idx, file);
-                            formData.append("fileName_" + idx, file.name);
-                        });
-
                         status.innerText = 'Lähetetään...';
-                        const res = await fetch('/api/send', {
-                            method: 'POST',
-                            body: formData
-                        });
+
+                        let res;
+                        if (files.length === 0) {
+                            res = await fetch('/api/send-text', {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json; charset=utf-8' },
+                                body: JSON.stringify({ phone: phone, message: message })
+                            });
+                        } else {
+                            const formData = new FormData();
+                            formData.append("phone", phone);
+                            formData.append("message", message);
+                            files.forEach((file, idx) => {
+                                formData.append("attachment_" + idx, file);
+                                formData.append("fileName_" + idx, file.name);
+                            });
+                            res = await fetch('/api/send', {
+                                method: 'POST',
+                                body: formData
+                            });
+                        }
+
                         const data = await res.json();
 
                         if (data.success) {
@@ -920,6 +988,8 @@ class SmsServerService : Service() {
                             document.getElementById('msg').value = '';
                             fileInput.value = '';
                             setTimeout(() => loadMessages(targetPhone), 1500);
+                        } else {
+                            status.innerText = 'Virhe: ' + (data.error || 'Tuntematon virhe');
                         }
                     }
 

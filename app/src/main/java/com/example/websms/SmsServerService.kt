@@ -44,7 +44,11 @@ data class ChatMessageItem(
     val mediaParts: List<MediaPartItem> = emptyList()
 )
 
-data class ApiResponse(val success: Boolean, val error: String? = null)
+data class ApiResponse(
+    val success: Boolean,
+    val error: String? = null,
+    val resolvedPhone: String? = null
+)
 
 class SmsServerService : Service() {
 
@@ -174,6 +178,55 @@ class SmsServerService : Service() {
             putExtra(EXTRA_LOG_TEXT, currentLog)
         }
         LocalBroadcastManager.getInstance(this).sendBroadcast(intent)
+    }
+
+    private fun resolveRecipientPhone(rawInput: String): Pair<String?, String?> {
+        val trimmed = rawInput.trim()
+        if (trimmed.isEmpty()) {
+            return Pair(null, "Valitse vastaanottaja tai syötä nimi/puhelinnumero.")
+        }
+
+        val contacts = getPhoneContacts()
+        val hasDigits = trimmed.any { it.isDigit() }
+
+        if (hasDigits) {
+            val normInput = normalizePhone(trimmed)
+            val suffix = if (normInput.length >= 7) normInput.takeLast(7) else normInput
+
+            val phoneMatches = contacts.filter { contact ->
+                val normContact = normalizePhone(contact.phone)
+                if (suffix.length >= 7 && normContact.length >= 7) {
+                    normContact.endsWith(suffix)
+                } else {
+                    normContact == normInput || contact.phone.equals(trimmed, ignoreCase = true)
+                }
+            }
+
+            val distinctPhones = phoneMatches.map { normalizePhone(it.phone) }.distinct()
+            return when {
+                phoneMatches.size == 1 -> Pair(phoneMatches.first().phone, null)
+                distinctPhones.size == 1 -> Pair(phoneMatches.first().phone, null)
+                phoneMatches.isEmpty() -> Pair(trimmed, null) // Suora puhelinnumero, jota ei ole osoitekirjassa
+                else -> Pair(null, "Numero '$trimmed' täsmää useaan yhteystietoon. Tarkenna numero.")
+            }
+        }
+
+        // Syöte on pelkkää nimeä -> vaatii yksiselitteisen osuman osoitekirjasta/keskusteluista
+        val exactNameMatches = contacts.filter {
+            it.name.equals(trimmed, ignoreCase = true)
+        }
+        val candidates = if (exactNameMatches.isNotEmpty()) {
+            exactNameMatches
+        } else {
+            contacts.filter { it.name.contains(trimmed, ignoreCase = true) }
+        }
+
+        val uniquePhones = candidates.map { normalizePhone(it.phone) }.distinct()
+        return when {
+            candidates.isEmpty() -> Pair(null, "Yhteystietoa '$trimmed' ei löytynyt.")
+            uniquePhones.size == 1 -> Pair(candidates.first().phone, null)
+            else -> Pair(null, "Nimi '$trimmed' on moniselitteinen (${uniquePhones.size} eri numeroa). Tarkenna nimi tai valitse listasta.")
+        }
     }
 
     private fun startServer() {
@@ -577,8 +630,13 @@ class SmsServerService : Service() {
                 }
 
                 session.uri == "/api/messages" && session.method == Method.GET -> {
-                    val phoneParam = session.parameters["phone"]?.firstOrNull()
-                    val json = gson.toJson(getPhoneMessages(phoneParam))
+                    val rawPhoneParam = session.parameters["phone"]?.firstOrNull()?.trim().orEmpty()
+                    val effectivePhone = if (rawPhoneParam.isNotEmpty() && !rawPhoneParam.any { it.isDigit() }) {
+                        resolveRecipientPhone(rawPhoneParam).first ?: rawPhoneParam
+                    } else {
+                        rawPhoneParam
+                    }
+                    val json = gson.toJson(getPhoneMessages(effectivePhone.ifBlank { null }))
                     newFixedLengthResponse(Response.Status.OK, "application/json; charset=utf-8", json)
                 }
 
@@ -613,8 +671,14 @@ class SmsServerService : Service() {
                     val filesMap = HashMap<String, String>()
                     session.parseBody(filesMap)
 
-                    val phone = session.parameters["phone"]?.firstOrNull()?.trim().orEmpty()
+                    val rawRecipient = session.parameters["phone"]?.firstOrNull()?.trim().orEmpty()
                     val message = session.parameters["message"]?.firstOrNull()?.trim().orEmpty()
+                    val (resolvedPhone, recipientError) = resolveRecipientPhone(rawRecipient)
+
+                    if (recipientError != null || resolvedPhone.isNullOrBlank()) {
+                        val errJson = gson.toJson(ApiResponse(success = false, error = recipientError ?: "Virheellinen vastaanottaja"))
+                        return newFixedLengthResponse(Response.Status.BAD_REQUEST, "application/json; charset=utf-8", errJson)
+                    }
                     val batchTimestamp = System.currentTimeMillis()
                     val savedFiles = mutableListOf<File>()
 
@@ -649,12 +713,12 @@ class SmsServerService : Service() {
 
                     return try {
                         if (savedFiles.isNotEmpty()) {
-                            openMmsComposer(phone, message, savedFiles)
+                            openMmsComposer(resolvedPhone, message, savedFiles)
                         } else {
-                            sendSms(phone, message)
+                            sendSms(resolvedPhone, message)
                         }
 
-                        val okJson = gson.toJson(ApiResponse(success = true))
+                        val okJson = gson.toJson(ApiResponse(success = true, resolvedPhone = resolvedPhone))
                         newFixedLengthResponse(Response.Status.OK, "application/json; charset=utf-8", okJson)
                     } catch (e: Exception) {
                         val errJson = gson.toJson(ApiResponse(success = false, error = e.message ?: "Tuntematon virhe"))
@@ -713,8 +777,8 @@ class SmsServerService : Service() {
                 </div>
                 <div id="chat">
                     <div id="chatHeader">
-                        <h2 id="recipientTitle">Valitse keskustelu tai syötä numero</h2>
-                        <input type="text" id="manualPhone" placeholder="Numero (+358...)" onchange="loadMessages(this.value)">
+                        <h2 id="recipientTitle">Valitse keskustelu, syötä numero tai anna nimi</h2>
+                        <input type="text" id="manualPhone" placeholder="Nimi tai numero (+358...)" onchange="loadMessages(this.value)">
                         <button id="refreshBtn" onclick="loadMessages(document.getElementById('manualPhone').value)">Päivitä</button>
                     </div>
                     <div id="messages">
@@ -846,14 +910,16 @@ class SmsServerService : Service() {
                         const data = await res.json();
 
                         if (data.success) {
+                            const targetPhone = data.resolvedPhone || phone;
+                            if (data.resolvedPhone) {
+                                document.getElementById('manualPhone').value = data.resolvedPhone;
+                            }
                             status.innerText = files.length > 0
                                 ? 'Viestisovellus avattu (' + files.length + ' liitettä)!'
-                                : 'Tekstiviesti lähetetty!';
+                                : 'Tekstiviesti lähetetty (' + targetPhone + ')!';
                             document.getElementById('msg').value = '';
                             fileInput.value = '';
-                            setTimeout(() => loadMessages(phone), 1500);
-                        } else {
-                            status.innerText = 'Virhe: ' + (data.error || 'Tuntematon virhe');
+                            setTimeout(() => loadMessages(targetPhone), 1500);
                         }
                     }
 

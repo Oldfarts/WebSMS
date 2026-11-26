@@ -38,6 +38,13 @@ data class MediaPartItem(
     val isVideo: Boolean
 )
 
+private data class MultipartPart(
+    val name: String,
+    val fileName: String?,
+    val isFile: Boolean,
+    val bytes: ByteArray
+)
+
 data class ChatMessageItem(
     val id: String,
     val address: String,
@@ -672,47 +679,38 @@ class SmsServerService : Service() {
                 }
 
                 session.uri == "/api/send" && session.method == Method.POST -> {
-                    val filesMap = HashMap<String, String>()
-                    session.parseBody(filesMap)
+                    val bodyBytes = readRequestBodyBytes(session)
+                    val parts = parseMultipartParts(session, bodyBytes)
 
-                    val rawRecipient = decodeUtf8Field(session.parameters["phone"]?.firstOrNull()?.trim())
-                    val message = decodeUtf8Field(session.parameters["message"]?.firstOrNull()?.trim())
+                    val textFields = mutableMapOf<String, String>()
+                    for (part in parts) {
+                        if (!part.isFile) {
+                            textFields[part.name] = String(part.bytes, Charsets.UTF_8)
+                        }
+                    }
+
+                    val rawRecipient = (textFields["phone"] ?: session.parameters["phone"]?.firstOrNull()).orEmpty().trim()
+                    val message = (textFields["message"] ?: session.parameters["message"]?.firstOrNull()).orEmpty().trim()
+
                     val (resolvedPhone, recipientError) = resolveRecipientPhone(rawRecipient)
-
                     if (recipientError != null || resolvedPhone.isNullOrBlank()) {
                         val errJson = gson.toJson(ApiResponse(success = false, error = recipientError ?: "Virheellinen vastaanottaja"))
                         return newFixedLengthResponse(Response.Status.BAD_REQUEST, "application/json; charset=utf-8", errJson)
                     }
+
                     val batchTimestamp = System.currentTimeMillis()
                     val savedFiles = mutableListOf<File>()
 
-                    val attachmentKeys = filesMap.keys
-                        .filter { it == "attachment" || it.startsWith("attachment_") }
-                        .sorted()
+                    val fileParts = parts
+                        .filter { it.isFile && it.bytes.isNotEmpty() }
+                        .sortedBy { it.name }
 
-                    attachmentKeys.forEachIndexed { index, key ->
-                        val tempPath = filesMap[key] ?: return@forEachIndexed
-                        val tempFile = File(tempPath)
-                        if (tempFile.exists() && tempFile.length() > 0) {
-                            val nameKey = if (key == "attachment") "fileName" else "fileName_${key.removePrefix("attachment_")}"
-                            val originalFileName = session.parameters[nameKey]
-                                ?.firstOrNull()
-                                ?.substringAfterLast("/")
-                                ?.substringAfterLast("\\")
-                                .orEmpty()
-
-                            val rawExt = originalFileName.substringAfterLast(".", "")
-                                .lowercase(Locale.ROOT)
-                            val extension = if (rawExt.isNotBlank()) rawExt else "jpg"
-                            val safeName = "upload_${batchTimestamp}_${index}.$extension"
-
-                            val saved = when (extension) {
-                                "jpg", "jpeg", "png", "gif", "webp" -> saveImage(tempPath, safeName)
-                                "mp4", "3gp", "mkv", "avi", "webm" -> saveVideo(tempPath, safeName)
-                                else -> saveUploadedFile(tempPath, safeName)
-                            }
-                            savedFiles.add(saved)
-                        }
+                    fileParts.forEachIndexed { index, filePart ->
+                        val suffix = if (filePart.name == "attachment") "" else "_${filePart.name.removePrefix("attachment_")}"
+                        val partFileName = filePart.fileName?.takeIf { it.isNotBlank() }
+                            ?: textFields["fileName$suffix"]?.takeIf { it.isNotBlank() }
+                        val saved = writeTempAttachmentFile(filePart.bytes, index, batchTimestamp, partFileName)
+                        savedFiles.add(saved)
                     }
 
                     return try {
@@ -778,16 +776,145 @@ class SmsServerService : Service() {
 
         private fun decodeUtf8Field(raw: String?): String {
             if (raw.isNullOrEmpty()) return ""
-            // Jos merkkijono sisältää tyypillisiä UTF-8 -> ISO-8859-1 -virhemerkkejä (esim. Ã¤, Ã¶, Ã)
-            return if (raw.contains('Ã') || raw.contains('Å')) {
-                try {
-                    String(raw.toByteArray(Charsets.ISO_8859_1), Charsets.UTF_8)
-                } catch (_: Exception) {
-                    raw
+            return when {
+                raw.contains('Ã') || raw.contains('Å') -> {
+                    try {
+                        String(raw.toByteArray(Charsets.ISO_8859_1), Charsets.UTF_8)
+                    } catch (_: Exception) {
+                        raw
+                    }
                 }
-            } else {
-                raw
+                else -> raw
             }
+        }
+
+        private fun readRequestBodyBytes(session: NanoHTTPD.IHTTPSession): ByteArray {
+            val contentLength = session.headers["content-length"]?.toIntOrNull() ?: 0
+            if (contentLength <= 0) {
+                return try {
+                    session.inputStream.readBytes()
+                } catch (_: Exception) {
+                    ByteArray(0)
+                }
+            }
+            if (contentLength > 50 * 1024 * 1024) {
+                return ByteArray(0)
+            }
+
+            val buf = ByteArray(contentLength)
+            var offset = 0
+            while (offset < contentLength) {
+                val read = session.inputStream.read(buf, offset, contentLength - offset)
+                if (read <= 0) break
+                offset += read
+            }
+            return buf.copyOf(offset)
+        }
+
+        private fun parseMultipartParts(session: NanoHTTPD.IHTTPSession, bodyBytes: ByteArray): List<MultipartPart> {
+            if (bodyBytes.isEmpty()) return emptyList()
+
+            val contentType = session.headers["content-type"].orEmpty()
+            val boundary = Regex("boundary=([^;\\s]+)").find(contentType)?.groupValues?.get(1)?.trim('"')
+                ?: return emptyList()
+
+            val boundaryBytes = "--$boundary".toByteArray(Charsets.ISO_8859_1)
+            val crlfCrlf = "\r\n\r\n".toByteArray(Charsets.ISO_8859_1)
+
+            val parts = mutableListOf<MultipartPart>()
+            var pos = indexOfBytes(bodyBytes, boundaryBytes, 0)
+
+            while (pos >= 0) {
+                val partStart = pos + boundaryBytes.size
+                if (partStart + 1 < bodyBytes.size &&
+                    bodyBytes[partStart] == '-'.code.toByte() &&
+                    bodyBytes[partStart + 1] == '-'.code.toByte()
+                ) {
+                    break
+                }
+
+                val headerStart = if (partStart + 1 < bodyBytes.size &&
+                    bodyBytes[partStart] == '\r'.code.toByte() &&
+                    bodyBytes[partStart + 1] == '\n'.code.toByte()
+                ) {
+                    partStart + 2
+                } else {
+                    partStart
+                }
+
+                val headerEnd = indexOfBytes(bodyBytes, crlfCrlf, headerStart)
+                if (headerEnd < 0) break
+
+                val headersText = String(bodyBytes, headerStart, headerEnd - headerStart, Charsets.ISO_8859_1)
+                val fieldName = Regex("name=\"([^\"]+)\"").find(headersText)?.groupValues?.get(1)
+                val rawFileName = Regex("filename=\"([^\"]*)\"").find(headersText)?.groupValues?.get(1)
+                val isFile = rawFileName != null
+
+                val valueStart = headerEnd + crlfCrlf.size
+                val nextBoundary = indexOfBytes(bodyBytes, boundaryBytes, valueStart)
+                if (nextBoundary < 0) break
+
+                var valueEnd = nextBoundary
+                if (valueEnd >= 2 &&
+                    bodyBytes[valueEnd - 2] == '\r'.code.toByte() &&
+                    bodyBytes[valueEnd - 1] == '\n'.code.toByte()
+                ) {
+                    valueEnd -= 2
+                }
+
+                if (fieldName != null && valueEnd >= valueStart) {
+                    val partBytes = bodyBytes.copyOfRange(valueStart, valueEnd)
+                    val cleanFileName = rawFileName?.let {
+                        String(it.toByteArray(Charsets.ISO_8859_1), Charsets.UTF_8)
+                            .substringAfterLast("/")
+                            .substringAfterLast("\\")
+                    }
+                    parts.add(
+                        MultipartPart(
+                            name = fieldName,
+                            fileName = cleanFileName,
+                            isFile = isFile,
+                            bytes = partBytes
+                        )
+                    )
+                }
+
+                pos = nextBoundary
+            }
+
+            return parts
+        }
+
+        private fun writeTempAttachmentFile(bytes: ByteArray, index: Int, batchTimestamp: Long, originalFileName: String?): File {
+            val safeOriginal = originalFileName.orEmpty()
+            val rawExt = safeOriginal.substringAfterLast(".", "").lowercase(Locale.ROOT)
+            val extension = if (rawExt.isNotBlank()) rawExt else "jpg"
+            val safeName = "upload_${batchTimestamp}_${index}.$extension"
+
+            val tempFile = File(cacheDir, "mms_part_${batchTimestamp}_${index}.$extension")
+            tempFile.writeBytes(bytes)
+
+            return when (extension) {
+                "jpg", "jpeg", "png", "gif", "webp" -> saveImage(tempFile.absolutePath, safeName).also { tempFile.delete() }
+                "mp4", "3gp", "mkv", "avi", "webm" -> saveVideo(tempFile.absolutePath, safeName).also { tempFile.delete() }
+                else -> saveUploadedFile(tempFile.absolutePath, safeName).also { tempFile.delete() }
+            }
+        }
+
+        private fun indexOfBytes(haystack: ByteArray, needle: ByteArray, fromIndex: Int): Int {
+            if (needle.isEmpty() || fromIndex >= haystack.size) return -1
+            val limit = haystack.size - needle.size
+            for (i in fromIndex..limit) {
+                var matched = true
+                for (j in needle.indices) {
+                    if (haystack[i + j] != needle[j]) {
+                        matched = false
+                        break
+                    }
+                }
+                if (matched) return i
+            }
+            return -1
         }
 
         private fun getWebHtml(): String = """

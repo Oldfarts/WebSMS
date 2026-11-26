@@ -1,30 +1,35 @@
 package com.example.websms
 
 import android.Manifest
+import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Bundle
 import android.provider.ContactsContract
+import android.provider.Telephony
 import android.telephony.SmsManager
 import android.view.WindowManager
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
 import com.google.gson.Gson
 import fi.iki.elonen.NanoHTTPD
+import java.io.File
 import java.util.Locale
 
 data class ContactItem(val name: String, val phone: String)
-data class SendRequest(val phone: String, val message: String)
+data class ApiResponse(val success: Boolean, val error: String? = null)
 
 class MainActivity : AppCompatActivity() {
 
     private lateinit var tvServerAddress: TextView
     private lateinit var tvLog: TextView
     private var webServer: SmsWebServer? = null
-    private val PERMISSION_CODE = 123
+    private val permissionCode = 123
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -49,7 +54,7 @@ class MainActivity : AppCompatActivity() {
         if (missing.isEmpty()) {
             startWebServer()
         } else {
-            ActivityCompat.requestPermissions(this, missing.toTypedArray(), PERMISSION_CODE)
+            ActivityCompat.requestPermissions(this, missing.toTypedArray(), permissionCode)
         }
     }
 
@@ -59,7 +64,7 @@ class MainActivity : AppCompatActivity() {
         grantResults: IntArray
     ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode == PERMISSION_CODE && grantResults.all { it == PackageManager.PERMISSION_GRANTED }) {
+        if (requestCode == permissionCode && grantResults.all { it == PackageManager.PERMISSION_GRANTED }) {
             startWebServer()
         } else {
             tvLog.text = "Sovellus tarvitsee luvan yhteystietoihin ja tekstiviesteihin."
@@ -71,6 +76,7 @@ class MainActivity : AppCompatActivity() {
             val ip = getWifiIpAddress()
             val port = 8080
 
+            webServer?.stop()
             webServer = SmsWebServer(port)
             webServer?.start()
 
@@ -118,7 +124,7 @@ class MainActivity : AppCompatActivity() {
         return list.distinctBy { it.phone }
     }
 
-    // Lähettää SMS:n puhelimen SIM-kortilla
+    // Lähettää SMS:n automaattisesti puhelimen SIM-kortilla (ilman lisäpainalluksia)
     private fun sendSms(phone: String, message: String) {
         val smsManager: SmsManager = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             this.getSystemService(SmsManager::class.java)
@@ -130,7 +136,122 @@ class MainActivity : AppCompatActivity() {
         smsManager.sendMultipartTextMessage(phone, null, parts, null, null)
 
         runOnUiThread {
-            tvLog.text = "Viimeisin lähetys: $phone"
+            tvLog.text = "SMS lähetetty automaattisesti: $phone"
+        }
+    }
+
+    private fun saveUploadedFile(tempFilePath: String, fileName: String): File {
+        val uploadDir = File(filesDir, "attachments")
+        if (!uploadDir.exists()) {
+            uploadDir.mkdirs()
+        }
+        val destination = File(uploadDir, fileName)
+        File(tempFilePath).copyTo(destination, overwrite = true)
+        return destination
+    }
+
+    private fun saveImage(tempFilePath: String, fileName: String): File {
+        val picturesDir = getExternalFilesDir(android.os.Environment.DIRECTORY_PICTURES) ?: filesDir
+        val webSmsDir = File(picturesDir, "WebSMS")
+        if (!webSmsDir.exists()) {
+            webSmsDir.mkdirs()
+        }
+        val destination = File(webSmsDir, fileName)
+        File(tempFilePath).copyTo(destination, overwrite = true)
+        return destination
+    }
+
+    private fun saveVideo(tempFilePath: String, fileName: String): File {
+        val moviesDir = getExternalFilesDir(android.os.Environment.DIRECTORY_MOVIES) ?: filesDir
+        val webSmsDir = File(moviesDir, "WebSMS")
+        if (!webSmsDir.exists()) {
+            webSmsDir.mkdirs()
+        }
+        val destination = File(webSmsDir, fileName)
+        File(tempFilePath).copyTo(destination, overwrite = true)
+        return destination
+    }
+
+    private fun detectMimeType(file: File): String {
+        return when (file.extension.lowercase(Locale.ROOT)) {
+            "jpg", "jpeg" -> "image/jpeg"
+            "png" -> "image/png"
+            "gif" -> "image/gif"
+            "webp" -> "image/webp"
+            "mp4" -> "video/mp4"
+            "3gp" -> "video/3gpp"
+            "mkv" -> "video/x-matroska"
+            "webm" -> "video/webm"
+            else -> "*/*"
+        }
+    }
+
+    // Avaa oletusviestisovelluksen yhdelle tai useammalle liitteelle
+    // Avaa oletusviestisovelluksen yhdelle tai useammalle liitteelle
+    private fun openMmsComposer(phone: String, message: String, files: List<File>) {
+        try {
+            if (files.isEmpty()) return
+
+            val authority = "$packageName.fileprovider"
+            val uris = ArrayList<Uri>(files.size)
+            val mimeTypes = mutableSetOf<String>()
+
+            for (file in files) {
+                uris.add(FileProvider.getUriForFile(this, authority, file))
+                mimeTypes.add(detectMimeType(file))
+            }
+
+            val intentType = when {
+                mimeTypes.size == 1 -> mimeTypes.first()
+                mimeTypes.all { it.startsWith("image/") } -> "image/*"
+                mimeTypes.all { it.startsWith("video/") } -> "video/*"
+                else -> "*/*"
+            }
+
+            runOnUiThread {
+                tvLog.text = "MMS-liitteitä (${files.size} kpl):\n" +
+                        "TYPE=$intentType\n" +
+                        uris.joinToString("\n") { it.toString() }
+            }
+
+            val defaultSmsPackage = Telephony.Sms.getDefaultSmsPackage(this)
+
+            val intent = if (uris.size == 1) {
+                Intent(Intent.ACTION_SEND).apply {
+                    type = intentType
+                    putExtra(Intent.EXTRA_STREAM, uris.first())
+                }
+            } else {
+                Intent(Intent.ACTION_SEND_MULTIPLE).apply {
+                    type = intentType
+                    putParcelableArrayListExtra(Intent.EXTRA_STREAM, uris)
+                }
+            }.apply {
+                if (phone.isNotBlank()) {
+                    putExtra("address", phone)
+                }
+                if (message.isNotBlank()) {
+                    putExtra("sms_body", message)
+                    putExtra(Intent.EXTRA_TEXT, message)
+                }
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN && uris.isNotEmpty()) {
+                    clipData = android.content.ClipData.newUri(contentResolver, "MMS-liite", uris.first()).apply {
+                        for (i in 1 until uris.size) {
+                            addItem(android.content.ClipData.Item(uris[i]))
+                        }
+                    }
+                }
+                if (!defaultSmsPackage.isNullOrBlank()) {
+                    setPackage(defaultSmsPackage)
+                }
+            }
+
+            startActivity(intent)
+        } catch (e: Exception) {
+            runOnUiThread {
+                tvLog.text = "MMS VIRHE\n\n${e.stackTraceToString()}"
+            }
         }
     }
 
@@ -146,18 +267,61 @@ class MainActivity : AppCompatActivity() {
                     newFixedLengthResponse(Response.Status.OK, "application/json; charset=utf-8", json)
                 }
 
-                // 2. Vastaanottaa viestin selaimelta ja lähettää sen
+                // 2. Vastaanottaa viestin (ja 0..N liitettä) selaimelta
                 session.uri == "/api/send" && session.method == Method.POST -> {
-                    val files = HashMap<String, String>()
-                    session.parseBody(files)
-                    val postData = files["postData"] ?: "{}"
-                    val req = gson.fromJson(postData, SendRequest::class.java)
+                    val filesMap = HashMap<String, String>()
+                    session.parseBody(filesMap)
+
+                    val phone = session.parameters["phone"]?.firstOrNull()?.trim().orEmpty()
+                    val message = session.parameters["message"]?.firstOrNull()?.trim().orEmpty()
+                    val batchTimestamp = System.currentTimeMillis()
+
+                    val savedFiles = mutableListOf<File>()
+
+                    // Kerää kaikki kentät, joiden avain alkaa "attachment_" (sekä mahdollinen yksittäinen "attachment")
+                    val attachmentKeys = filesMap.keys
+                        .filter { it == "attachment" || it.startsWith("attachment_") }
+                        .sorted()
+
+                    attachmentKeys.forEachIndexed { index, key ->
+                        val tempPath = filesMap[key] ?: return@forEachIndexed
+                        val tempFile = File(tempPath)
+                        if (tempFile.exists() && tempFile.length() > 0) {
+                            val nameKey = if (key == "attachment") "fileName" else "fileName_${key.removePrefix("attachment_")}"
+                            val originalFileName = session.parameters[nameKey]
+                                ?.firstOrNull()
+                                ?.substringAfterLast("/")
+                                ?.substringAfterLast("\\")
+                                .orEmpty()
+
+                            val rawExt = originalFileName.substringAfterLast(".", "")
+                                .lowercase(Locale.ROOT)
+                            val extension = if (rawExt.isNotBlank()) rawExt else "jpg"
+                            val safeName = "upload_${batchTimestamp}_${index}.$extension"
+
+                            val saved = when (extension) {
+                                "jpg", "jpeg", "png", "gif", "webp" -> saveImage(tempPath, safeName)
+                                "mp4", "3gp", "mkv", "avi", "webm" -> saveVideo(tempPath, safeName)
+                                else -> saveUploadedFile(tempPath, safeName)
+                            }
+                            savedFiles.add(saved)
+                        }
+                    }
 
                     return try {
-                        sendSms(req.phone, req.message)
-                        newFixedLengthResponse(Response.Status.OK, "application/json", """{"success":true}""")
+                        if (savedFiles.isNotEmpty()) {
+                            runOnUiThread {
+                                openMmsComposer(phone, message, savedFiles)
+                            }
+                        } else {
+                            sendSms(phone, message)
+                        }
+
+                        val okJson = gson.toJson(ApiResponse(success = true))
+                        newFixedLengthResponse(Response.Status.OK, "application/json; charset=utf-8", okJson)
                     } catch (e: Exception) {
-                        newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "application/json", """{"success":false,"error":"${e.message}"}""")
+                        val errJson = gson.toJson(ApiResponse(success = false, error = e.message ?: "Tuntematon virhe"))
+                        newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "application/json; charset=utf-8", errJson)
                     }
                 }
 
@@ -196,9 +360,22 @@ class MainActivity : AppCompatActivity() {
                 </div>
                 <div id="chat">
                     <h2 id="recipientTitle">Valitse vastaanottaja vasemmalta</h2>
-                    <input type="text" id="manualPhone" placeholder="Tai kirjoita numero käsin (+358...)" style="padding:10px; font-size:15px;">
-                    <textarea id="msg" placeholder="Kirjoita tekstiviesti..."></textarea>
-                    <button onclick="send()">Lähetä tekstiviesti</button>
+                    <input type="text" id="manualPhone"
+                           placeholder="Tai kirjoita numero käsin (+358...)"
+                           style="padding:10px; font-size:15px;">
+
+                    <textarea id="msg"
+                              placeholder="Kirjoita tekstiviesti..."></textarea>
+
+                    <h3>Lisää kuvia tai videoita viestiin?</h3>
+                    <input type="file"
+                           id="attachment"
+                           accept="image/*,video/*"
+                           multiple
+                           style="margin:12px 0;">
+
+                    <button onclick="send()">Lähetä viesti</button>
+
                     <p id="status"></p>
                 </div>
                 <script>
@@ -227,21 +404,44 @@ class MainActivity : AppCompatActivity() {
                         renderContacts(allContacts.filter(c => c.name.toLowerCase().includes(q) || c.phone.includes(q)));
                     }
                     async function send() {
+                        const fileInput = document.getElementById('attachment');
+                        const files = Array.from(fileInput.files || []);
                         const phone = document.getElementById('manualPhone').value.trim();
                         const message = document.getElementById('msg').value.trim();
                         const status = document.getElementById('status');
-                        if (!phone || !message) return alert('Valitse vastaanottaja ja kirjoita viesti.');
+
+                        if (!phone) {
+                            alert('Valitse vastaanottaja tai syötä puhelinnumero.');
+                            return;
+                        }
+                        if (!message && files.length === 0) {
+                            alert('Kirjoita viesti tai valitse liite.');
+                            return;
+                        }
+
+                        const formData = new FormData();
+                        formData.append("phone", phone);
+                        formData.append("message", message);
+                        files.forEach((file, idx) => {
+                            formData.append("attachment_" + idx, file);
+                            formData.append("fileName_" + idx, file.name);
+                        });
+
                         status.innerText = 'Lähetetään...';
                         const res = await fetch('/api/send', {
                             method: 'POST',
-                            body: JSON.stringify({ phone, message })
+                            body: formData
                         });
                         const data = await res.json();
+
                         if (data.success) {
-                            status.innerText = 'Viesti lähetetty puhelimen kautta!';
+                            status.innerText = files.length > 0
+                                ? 'Viestisovellus avattu (' + files.length + ' liitettä)!'
+                                : 'Tekstiviesti lähetetty automaattisesti!';
                             document.getElementById('msg').value = '';
+                            fileInput.value = '';
                         } else {
-                            status.innerText = 'Virhe: ' + data.error;
+                            status.innerText = 'Virhe: ' + (data.error || 'Tuntematon virhe');
                         }
                     }
                     loadContacts();
